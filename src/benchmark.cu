@@ -257,14 +257,15 @@ size_t estimate_method_state_bytes(const std::string& method, int dimension) {
 }
 
 size_t effective_memory_limit_bytes(const BenchmarkConfig& config) {
+    if (config.memory_cap_bytes != 0) {
+        return config.memory_cap_bytes;
+    }
+
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     CHECK_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
     const size_t headroom_adjusted = static_cast<size_t>(static_cast<double>(free_bytes) * 0.90);
-    if (config.memory_cap_bytes == 0) {
-        return headroom_adjusted;
-    }
-    return std::min(config.memory_cap_bytes, headroom_adjusted);
+    return headroom_adjusted;
 }
 
 std::string bytes_to_string(size_t bytes) {
