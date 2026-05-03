@@ -12,7 +12,7 @@ The benchmark measures:
 - `apply_ms`: apply the fixed transform to one vector.
 - `end_to_end_ms`: setup plus one apply.
 
-All timings are repeated multiple times per dimension and summarized with 95% confidence intervals.
+All timings are repeated multiple times per dimension and summarized with 95% confidence intervals. Very small sub-millisecond paths are timed in batches and then divided back down to per-transform runtimes so the RHT path is less distorted by kernel-launch overhead.
 
 ## Repository Layout
 
@@ -46,17 +46,24 @@ python scripts/run_tests.py
 ## Benchmark
 
 ```powershell
-.\build\Release\rotation_bench.exe --benchmark --output results\runtime_results.csv
+.\build\Release\rotation_bench.exe --benchmark --target-batch-ms 50 --max-batch-repeats 1024 --output results\runtime_results.csv
 python scripts/plot_results.py
+```
+
+Useful overrides:
+
+```powershell
+.\build\Release\rotation_bench.exe --benchmark --min-power 8 --max-power 15 --target-batch-ms 50 --max-batch-repeats 1024 --output results\runtime_results.csv
 ```
 
 ## Current Results
 
 From the included benchmark run:
 
-- At `d = 16384`, `end_to_end_ms` was about `1017.80 ms` for `haar_qr`, `223.10 ms` for `reflector_chain`, and `0.109 ms` for `rht`.
-- At `d = 16384`, `apply_ms` alone was about `1.554 ms` for `haar_qr`, `219.41 ms` for `reflector_chain`, and `0.104 ms` for `rht`.
-- The dense Haar path has by far the highest setup cost but a much faster apply than the reflector chain once the matrix is built.
-- The RHT path is the fastest overall, but it is a structured orthogonal transform rather than a Haar-uniform rotation.
+- The sweep now runs through `d = 32768`.
+- At `d = 32768`, `end_to_end_ms` was about `9510.75 ms` for `haar_qr`, `984.36 ms` for `reflector_chain`, and `0.125 ms` for `rht`.
+- At `d = 32768`, `apply_ms` alone was about `6.70 ms` for `haar_qr`, `969.16 ms` for `reflector_chain`, and `0.110 ms` for `rht`.
+- The large-d empirical end-to-end exponent is now clearly different: about `2.823` for `haar_qr` on the largest three points versus about `2.086` for `reflector_chain`.
+- The RHT path remains the fastest overall, but it is a structured orthogonal transform rather than a Haar-uniform rotation, and its single-vector GPU timings sit close to the launch-dominated regime for smaller dimensions.
 
 See `results/runtime_summary.md` and the PNG figures under `results/figures/` for the complete tables and confidence intervals.

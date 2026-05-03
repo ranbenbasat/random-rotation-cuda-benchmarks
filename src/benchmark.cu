@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -31,6 +32,7 @@ struct TrialRecord {
     std::string metric;
     int trial = 0;
     float time_ms = 0.0f;
+    int batch_repeats = 1;
     std::string status = "ok";
     std::string note;
 };
@@ -38,6 +40,10 @@ struct TrialRecord {
 struct BenchmarkConfig {
     std::string csv_path = "results/runtime_results.csv";
     int warmup_trials = 2;
+    int min_power = 8;
+    int max_power = 15;
+    float target_batch_ms = 10.0f;
+    int max_batch_repeats = 256;
 };
 
 uint64_t compose_seed(uint64_t base_seed, int dimension, uint64_t method_tag, uint64_t extra = 0) {
@@ -177,6 +183,12 @@ std::string run_self_test() {
 
 int choose_trial_count(const std::string& method, int dimension) {
     if (method == "haar_qr") {
+        if (dimension >= 32768) {
+            return 3;
+        }
+        if (dimension >= 16384) {
+            return 4;
+        }
         if (dimension >= 8192) {
             return 5;
         }
@@ -186,9 +198,58 @@ int choose_trial_count(const std::string& method, int dimension) {
         return 8;
     }
     if (method == "reflector_chain") {
-        return 14;
+        if (dimension >= 32768) {
+            return 8;
+        }
+        if (dimension >= 16384) {
+            return 10;
+        }
+        return 12;
     }
-    return 18;
+    if (dimension >= 32768) {
+        return 12;
+    }
+    return 16;
+}
+
+std::vector<int> build_dimensions(const BenchmarkConfig& config) {
+    if (config.min_power < 1 || config.max_power < config.min_power || config.max_power >= 31) {
+        throw_runtime("Invalid power range for benchmark dimensions.");
+    }
+
+    std::vector<int> dimensions;
+    for (int power = config.min_power; power <= config.max_power; ++power) {
+        dimensions.push_back(1 << power);
+    }
+    return dimensions;
+}
+
+template <typename Fn>
+int choose_batch_repeats(
+    ScopedCudaEvent& timer,
+    float target_batch_ms,
+    int max_batch_repeats,
+    Fn&& fn) {
+    if (target_batch_ms <= 0.0f) {
+        return 1;
+    }
+    const float single_ms = timer.time([&]() { fn(0); });
+    const float clamped_single_ms = std::max(single_ms, 1e-6f);
+    const int suggested = static_cast<int>(std::ceil(target_batch_ms / clamped_single_ms));
+    return std::max(1, std::min(max_batch_repeats, suggested));
+}
+
+template <typename Fn>
+float time_average_ms(
+    ScopedCudaEvent& timer,
+    int repeats,
+    Fn&& fn) {
+    const float total_ms = timer.time([&]() {
+        for (int repeat = 0; repeat < repeats; ++repeat) {
+            fn(repeat);
+        }
+    });
+    return total_ms / static_cast<float>(repeats);
 }
 
 template <typename Rotation, typename BuildFn, typename ApplyFn>
@@ -196,6 +257,7 @@ void benchmark_method(
     std::vector<TrialRecord>& records,
     const std::string& method,
     int dimension,
+    const BenchmarkConfig& config,
     uint64_t base_seed,
     DeviceBuffer<float>& input,
     DeviceBuffer<float>& output,
@@ -204,26 +266,77 @@ void benchmark_method(
     ApplyFn&& apply_fn) {
     ScopedCudaEvent timer;
     const int trials = choose_trial_count(method, dimension);
-    const int warmups = 2;
+    const int warmups = config.warmup_trials;
 
-    for (int warmup = 0; warmup < warmups; ++warmup) {
-        build_fn(rotation, compose_seed(base_seed, dimension, 0xfedcbaULL, static_cast<uint64_t>(warmup)));
-        apply_fn(rotation, input.data(), output.data());
-        CHECK_CUDA(cudaDeviceSynchronize());
-    }
+    try {
+        for (int warmup = 0; warmup < warmups; ++warmup) {
+            build_fn(rotation, compose_seed(base_seed, dimension, 0xfedcbaULL, static_cast<uint64_t>(warmup)));
+            apply_fn(rotation, input.data(), output.data());
+            CHECK_CUDA(cudaDeviceSynchronize());
+        }
 
-    for (int trial = 0; trial < trials; ++trial) {
-        try {
-            const uint64_t seed = compose_seed(base_seed, dimension, 0x13579bULL, static_cast<uint64_t>(trial));
-            const float setup_ms = timer.time([&]() { build_fn(rotation, seed); });
-            records.push_back({method, dimension, "setup_ms", trial, setup_ms, "ok", ""});
+        const int setup_repeats = choose_batch_repeats(
+            timer,
+            config.target_batch_ms,
+            config.max_batch_repeats,
+            [&](int repeat) {
+                build_fn(rotation, compose_seed(base_seed, dimension, 0xabc000ULL, static_cast<uint64_t>(repeat)));
+            });
 
-            const float apply_ms = timer.time([&]() { apply_fn(rotation, input.data(), output.data()); });
-            records.push_back({method, dimension, "apply_ms", trial, apply_ms, "ok", ""});
-            records.push_back({method, dimension, "end_to_end_ms", trial, setup_ms + apply_ms, "ok", ""});
-        } catch (const std::exception& ex) {
-            records.push_back({method, dimension, "setup_ms", trial, 0.0f, "failed", ex.what()});
-            break;
+        build_fn(rotation, compose_seed(base_seed, dimension, 0xdef000ULL));
+        const int apply_repeats = choose_batch_repeats(
+            timer,
+            config.target_batch_ms,
+            config.max_batch_repeats,
+            [&](int) { apply_fn(rotation, input.data(), output.data()); });
+
+        const int end_to_end_repeats = choose_batch_repeats(
+            timer,
+            config.target_batch_ms,
+            config.max_batch_repeats,
+            [&](int repeat) {
+                build_fn(rotation, compose_seed(base_seed, dimension, 0xeee000ULL, static_cast<uint64_t>(repeat)));
+                apply_fn(rotation, input.data(), output.data());
+            });
+
+        for (int trial = 0; trial < trials; ++trial) {
+            const float setup_ms = time_average_ms(
+                timer,
+                setup_repeats,
+                [&](int repeat) {
+                    const uint64_t seed = compose_seed(
+                        base_seed,
+                        dimension,
+                        0x13579bULL + static_cast<uint64_t>(trial),
+                        static_cast<uint64_t>(trial) * 4096ULL + static_cast<uint64_t>(repeat));
+                    build_fn(rotation, seed);
+                });
+            records.push_back({method, dimension, "setup_ms", trial, setup_ms, setup_repeats, "ok", ""});
+
+            build_fn(rotation, compose_seed(base_seed, dimension, 0x2468acULL, static_cast<uint64_t>(trial)));
+            const float apply_ms = time_average_ms(
+                timer,
+                apply_repeats,
+                [&](int) { apply_fn(rotation, input.data(), output.data()); });
+            records.push_back({method, dimension, "apply_ms", trial, apply_ms, apply_repeats, "ok", ""});
+
+            const float end_to_end_ms = time_average_ms(
+                timer,
+                end_to_end_repeats,
+                [&](int repeat) {
+                    const uint64_t seed = compose_seed(
+                        base_seed,
+                        dimension,
+                        0x987654ULL + static_cast<uint64_t>(trial),
+                        static_cast<uint64_t>(trial) * 4096ULL + static_cast<uint64_t>(repeat));
+                    build_fn(rotation, seed);
+                    apply_fn(rotation, input.data(), output.data());
+                });
+            records.push_back({method, dimension, "end_to_end_ms", trial, end_to_end_ms, end_to_end_repeats, "ok", ""});
+        }
+    } catch (const std::exception& ex) {
+        for (const std::string& metric : {"setup_ms", "apply_ms", "end_to_end_ms"}) {
+            records.push_back({method, dimension, metric, 0, 0.0f, 1, "failed", ex.what()});
         }
     }
 }
@@ -248,7 +361,7 @@ void write_csv(const std::string& csv_path, const std::vector<TrialRecord>& reco
     if (!out) {
         throw_runtime("Unable to open CSV output: " + csv_path);
     }
-    out << "method,dimension,metric,trial,time_ms,status,note\n";
+    out << "method,dimension,metric,trial,time_ms,batch_repeats,status,note\n";
     for (const TrialRecord& record : records) {
         std::string note = record.note;
         std::replace(note.begin(), note.end(), ',', ';');
@@ -258,6 +371,7 @@ void write_csv(const std::string& csv_path, const std::vector<TrialRecord>& reco
             << record.metric << ','
             << record.trial << ','
             << std::fixed << std::setprecision(6) << record.time_ms << ','
+            << record.batch_repeats << ','
             << record.status << ','
             << note << '\n';
     }
@@ -265,7 +379,7 @@ void write_csv(const std::string& csv_path, const std::vector<TrialRecord>& reco
 
 void run_benchmark(const BenchmarkConfig& config) {
     constexpr uint64_t base_seed = 0x91f2e7d4c3b5a601ULL;
-    const std::array<int, 7> dimensions = {256, 512, 1024, 2048, 4096, 8192, 16384};
+    const std::vector<int> dimensions = build_dimensions(config);
 
     cublasHandle_t cublas_handle = nullptr;
     cusolverDnHandle_t solver_handle = nullptr;
@@ -286,6 +400,7 @@ void run_benchmark(const BenchmarkConfig& config) {
                 records,
                 "haar_qr",
                 dimension,
+                config,
                 base_seed,
                 input,
                 output,
@@ -300,6 +415,7 @@ void run_benchmark(const BenchmarkConfig& config) {
                 records,
                 "reflector_chain",
                 dimension,
+                config,
                 base_seed,
                 input,
                 output,
@@ -314,6 +430,7 @@ void run_benchmark(const BenchmarkConfig& config) {
                 records,
                 "rht",
                 dimension,
+                config,
                 base_seed,
                 input,
                 output,
@@ -344,6 +461,14 @@ int main(int argc, char** argv) {
                 mode = "--benchmark";
             } else if (arg == "--output" && i + 1 < argc) {
                 config.csv_path = argv[++i];
+            } else if (arg == "--min-power" && i + 1 < argc) {
+                config.min_power = std::stoi(argv[++i]);
+            } else if (arg == "--max-power" && i + 1 < argc) {
+                config.max_power = std::stoi(argv[++i]);
+            } else if (arg == "--target-batch-ms" && i + 1 < argc) {
+                config.target_batch_ms = std::stof(argv[++i]);
+            } else if (arg == "--max-batch-repeats" && i + 1 < argc) {
+                config.max_batch_repeats = std::stoi(argv[++i]);
             } else {
                 throw_runtime("Unknown argument: " + arg);
             }

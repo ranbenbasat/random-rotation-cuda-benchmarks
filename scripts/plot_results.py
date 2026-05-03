@@ -34,6 +34,7 @@ def load_rows():
             row["dimension"] = int(row["dimension"])
             row["trial"] = int(row["trial"])
             row["time_ms"] = float(row["time_ms"])
+            row["batch_repeats"] = int(row.get("batch_repeats", 1))
             rows.append(row)
     return rows
 
@@ -41,10 +42,12 @@ def load_rows():
 def summarize(rows):
     grouped = defaultdict(list)
     failures = defaultdict(list)
+    batch_repeats = defaultdict(list)
     for row in rows:
         key = (row["method"], row["dimension"], row["metric"])
         if row["status"] == "ok":
             grouped[key].append(row["time_ms"])
+            batch_repeats[key].append(row["batch_repeats"])
         else:
             failures[key].append(row["note"])
 
@@ -72,9 +75,40 @@ def summarize(rows):
                 "std_ms": std,
                 "ci95_low_ms": low,
                 "ci95_high_ms": high,
+                "batch_repeats": int(round(float(np.mean(batch_repeats[key])))),
             }
         )
     return sorted(summaries, key=lambda item: (item["metric"], item["method"], item["dimension"])), failures
+
+
+def local_exponents(summaries, metric):
+    rows = [row for row in summaries if row["metric"] == metric]
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row["method"]].append(row)
+
+    exponents = {}
+    for method, method_rows in grouped.items():
+        method_rows = sorted(method_rows, key=lambda item: item["dimension"])
+        adjacent = []
+        for left, right in zip(method_rows, method_rows[1:]):
+            exponent = math.log(right["mean_ms"] / left["mean_ms"], 2.0) / math.log(
+                right["dimension"] / left["dimension"], 2.0
+            )
+            adjacent.append((right["dimension"], exponent))
+
+        tail_rows = method_rows[-3:] if len(method_rows) >= 3 else method_rows
+        fit_exponent = None
+        if len(tail_rows) >= 2:
+            xs = np.log2([row["dimension"] for row in tail_rows])
+            ys = np.log2([row["mean_ms"] for row in tail_rows])
+            fit_exponent = float(np.polyfit(xs, ys, 1)[0])
+
+        exponents[method] = {
+            "adjacent": adjacent,
+            "tail_fit": fit_exponent,
+        }
+    return exponents
 
 
 def plot_metric(summaries, metric):
@@ -93,9 +127,10 @@ def plot_metric(summaries, metric):
         plt.plot(dims, means, marker="o", linewidth=2.0, color=color, label=METHOD_LABELS[method])
         plt.fill_between(dims, lows, highs, alpha=0.18, color=color)
 
+    all_dims = sorted({row["dimension"] for row in metric_rows})
     plt.xscale("log", base=2)
     plt.yscale("log")
-    plt.xticks([2 ** k for k in range(8, 15)], [f"$2^{{{k}}}$" for k in range(8, 15)])
+    plt.xticks(all_dims, [f"$2^{{{int(math.log2(dim))}}}$" for dim in all_dims])
     plt.xlabel("Vector dimension")
     plt.ylabel("Runtime (ms)")
     plt.title(f"{metric.replace('_', ' ').replace('ms', 'ms').title()} with 95% CI")
@@ -113,20 +148,41 @@ def write_summary(summaries, failures, figure_paths):
     lines.append("# Random Rotation Benchmark Summary")
     lines.append("")
     lines.append("The tables below report mean runtime in milliseconds with 95% confidence intervals across repeated trials.")
+    lines.append("Sub-millisecond paths use batched timing and are divided back down to per-transform runtimes to reduce launch-overhead noise.")
     lines.append("")
     for metric in ["setup_ms", "apply_ms", "end_to_end_ms"]:
         lines.append(f"## {metric}")
         lines.append("")
-        lines.append("| Method | Dimension | Trials | Mean (ms) | 95% CI (ms) |")
-        lines.append("| --- | ---: | ---: | ---: | ---: |")
+        lines.append("| Method | Dimension | Trials | Batch Repeats | Mean (ms) | 95% CI (ms) |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
         metric_rows = [row for row in summaries if row["metric"] == metric]
         for row in metric_rows:
             lines.append(
                 "| "
-                f"{METHOD_LABELS[row['method']]} | {row['dimension']} | {row['n']} | "
+                f"{METHOD_LABELS[row['method']]} | {row['dimension']} | {row['n']} | {row['batch_repeats']} | "
                 f"{row['mean_ms']:.6f} | [{row['ci95_low_ms']:.6f}, {row['ci95_high_ms']:.6f}] |"
             )
         lines.append("")
+
+    lines.append("## Empirical Scaling Exponents")
+    lines.append("")
+    lines.append("Adjacent exponents use consecutive powers of two. Tail fit uses the largest three available dimensions for that method/metric.")
+    lines.append("")
+    lines.append("| Method | Metric | Largest Adjacent Exponent | Tail Fit Exponent |")
+    lines.append("| --- | --- | ---: | ---: |")
+    for metric in ["setup_ms", "apply_ms", "end_to_end_ms"]:
+        metric_exponents = local_exponents(summaries, metric)
+        for method in ["haar_qr", "reflector_chain", "rht"]:
+            values = metric_exponents.get(method, {})
+            adjacent = values.get("adjacent", [])
+            largest_adjacent = adjacent[-1][1] if adjacent else float("nan")
+            tail_fit = values.get("tail_fit")
+            lines.append(
+                "| "
+                f"{METHOD_LABELS[method]} | {metric} | "
+                f"{largest_adjacent:.3f} | {tail_fit:.3f} |"
+            )
+    lines.append("")
 
     if failures:
         lines.append("## Failures")

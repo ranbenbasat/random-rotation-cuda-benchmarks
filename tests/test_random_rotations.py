@@ -1,3 +1,4 @@
+import csv
 import json
 import subprocess
 import unittest
@@ -87,6 +88,37 @@ class RandomRotationTests(unittest.TestCase):
         payload = self.run_self_test()
         for method, info in payload["methods"].items():
             self.assertLess(info["inverse_relative_error"], 1e-4, method)
+
+    def test_benchmark_accepts_dimension_range_and_target_batch_options(self):
+        output_path = ROOT / "build" / "test_runtime_results.csv"
+        if output_path.exists():
+            output_path.unlink()
+
+        subprocess.run(
+            [
+                str(executable_path()),
+                "--benchmark",
+                "--min-power",
+                "8",
+                "--max-power",
+                "8",
+                "--target-batch-ms",
+                "1",
+                "--output",
+                str(output_path),
+            ],
+            check=True,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        with output_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            dimensions = {int(row["dimension"]) for row in reader}
+
+        self.assertEqual(dimensions, {256})
+        output_path.unlink()
 
 
 if __name__ == "__main__":
