@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -44,6 +45,7 @@ struct BenchmarkConfig {
     int max_power = 15;
     float target_batch_ms = 10.0f;
     int max_batch_repeats = 256;
+    size_t memory_cap_bytes = 0;
 };
 
 uint64_t compose_seed(uint64_t base_seed, int dimension, uint64_t method_tag, uint64_t extra = 0) {
@@ -224,6 +226,64 @@ std::vector<int> build_dimensions(const BenchmarkConfig& config) {
     return dimensions;
 }
 
+size_t saturating_mul(size_t a, size_t b) {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    if (a > std::numeric_limits<size_t>::max() / b) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return a * b;
+}
+
+size_t estimate_method_state_bytes(const std::string& method, int dimension) {
+    const size_t n = static_cast<size_t>(dimension);
+    if (method == "haar_qr") {
+        const size_t matrix_elements = saturating_mul(n, n);
+        const size_t matrix_bytes = saturating_mul(matrix_elements, sizeof(float));
+        const size_t aux_bytes = saturating_mul(n, sizeof(float)) * 3ULL + sizeof(int);
+        return matrix_bytes + aux_bytes;
+    }
+    if (method == "reflector_chain") {
+        const size_t packed_elements = (saturating_mul(n, n + 1ULL) / 2ULL) - 1ULL;
+        const size_t packed_bytes = saturating_mul(packed_elements, sizeof(float));
+        const size_t aux_bytes = saturating_mul((2ULL * n) - 1ULL, sizeof(float));
+        return packed_bytes + aux_bytes;
+    }
+    if (method == "rht") {
+        return saturating_mul(2ULL * n, sizeof(float));
+    }
+    return 0;
+}
+
+size_t effective_memory_limit_bytes(const BenchmarkConfig& config) {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    CHECK_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t headroom_adjusted = static_cast<size_t>(static_cast<double>(free_bytes) * 0.90);
+    if (config.memory_cap_bytes == 0) {
+        return headroom_adjusted;
+    }
+    return std::min(config.memory_cap_bytes, headroom_adjusted);
+}
+
+std::string bytes_to_string(size_t bytes) {
+    std::ostringstream oss;
+    const double gib = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+    oss << std::fixed << std::setprecision(2) << gib << " GiB";
+    return oss.str();
+}
+
+void record_failure(
+    std::vector<TrialRecord>& records,
+    const std::string& method,
+    int dimension,
+    const std::string& note) {
+    for (const std::string& metric : {"setup_ms", "apply_ms", "end_to_end_ms"}) {
+        records.push_back({method, dimension, metric, 0, 0.0f, 1, "failed", note});
+    }
+}
+
 template <typename Fn>
 int choose_batch_repeats(
     ScopedCudaEvent& timer,
@@ -264,11 +324,23 @@ void benchmark_method(
     Rotation& rotation,
     BuildFn&& build_fn,
     ApplyFn&& apply_fn) {
-    ScopedCudaEvent timer;
     const int trials = choose_trial_count(method, dimension);
     const int warmups = config.warmup_trials;
 
     try {
+        const size_t estimated_bytes = estimate_method_state_bytes(method, dimension);
+        const size_t limit_bytes = effective_memory_limit_bytes(config);
+        if (estimated_bytes > limit_bytes) {
+            record_failure(
+                records,
+                method,
+                dimension,
+                "Skipped: estimated method state " + bytes_to_string(estimated_bytes) +
+                    " exceeds available benchmark limit " + bytes_to_string(limit_bytes));
+            return;
+        }
+
+        ScopedCudaEvent timer;
         for (int warmup = 0; warmup < warmups; ++warmup) {
             build_fn(rotation, compose_seed(base_seed, dimension, 0xfedcbaULL, static_cast<uint64_t>(warmup)));
             apply_fn(rotation, input.data(), output.data());
@@ -335,9 +407,7 @@ void benchmark_method(
             records.push_back({method, dimension, "end_to_end_ms", trial, end_to_end_ms, end_to_end_repeats, "ok", ""});
         }
     } catch (const std::exception& ex) {
-        for (const std::string& metric : {"setup_ms", "apply_ms", "end_to_end_ms"}) {
-            records.push_back({method, dimension, metric, 0, 0.0f, 1, "failed", ex.what()});
-        }
+        record_failure(records, method, dimension, ex.what());
     }
 }
 
@@ -469,6 +539,8 @@ int main(int argc, char** argv) {
                 config.target_batch_ms = std::stof(argv[++i]);
             } else if (arg == "--max-batch-repeats" && i + 1 < argc) {
                 config.max_batch_repeats = std::stoi(argv[++i]);
+            } else if (arg == "--memory-cap-bytes" && i + 1 < argc) {
+                config.memory_cap_bytes = static_cast<size_t>(std::stoull(argv[++i]));
             } else {
                 throw_runtime("Unknown argument: " + arg);
             }

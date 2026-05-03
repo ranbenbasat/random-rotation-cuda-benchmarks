@@ -120,6 +120,37 @@ class RandomRotationTests(unittest.TestCase):
         self.assertEqual(dimensions, {256})
         output_path.unlink()
 
+    def test_benchmark_records_failures_when_memory_cap_blocks_methods(self):
+        output_path = ROOT / "build" / "test_runtime_failures.csv"
+        if output_path.exists():
+            output_path.unlink()
+
+        subprocess.run(
+            [
+                str(executable_path()),
+                "--benchmark",
+                "--min-power",
+                "8",
+                "--max-power",
+                "8",
+                "--memory-cap-bytes",
+                "1",
+                "--output",
+                str(output_path),
+            ],
+            check=True,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        with output_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+
+        self.assertTrue(rows)
+        self.assertTrue(all(row["status"] == "failed" for row in rows))
+        output_path.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()
